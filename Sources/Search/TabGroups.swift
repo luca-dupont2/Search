@@ -106,6 +106,8 @@ struct GroupHeading: View {
             Button("Rename Group") { browser.editingGroupID = group.id }
             Button(group.collapsed ? "Expand Group" : "Collapse Group") { browser.toggleTabGroup(group.id) }
             Divider()
+            Button("Select Tabs in Group") { browser.selectTabs(inGroup: group.id) }
+            Divider()
             Button("Ungroup Tabs") { browser.removeTabGroup(group.id) }
         }
     }

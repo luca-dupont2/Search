@@ -16,7 +16,7 @@ enum Palette {
     static let muted = Color(nsColor: NS.muted)         // neutral-500
     static let faint = Color(nsColor: NS.faint)         // neutral-300 · neutral-700
     static let hairline = Color(nsColor: NS.hairline)   // neutral-200 · neutral-800
-    static let wash = Color(nsColor: NS.wash)           // the live tab
+    static let wash = Color(nsColor: NS.wash)           // live and selected tabs
     /// The live pin: among squares that already wear a faint grey, the one
     /// you are on stands out from them as a live row does from the white.
     static let pinLive = Color(nsColor: NS.pinLive)

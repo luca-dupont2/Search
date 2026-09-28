@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The only chrome there is. Titles, one of them in a grey pill, and the pill
@@ -269,7 +270,13 @@ struct TabBar: View {
             }
             .modifier(Carried(index: index, count: count, step: step, vertical: false,
                               space: "strip", onDropTab: { source, point in drop(source, at: point) },
-                              outside: { browser.dragOut(tab) }, browser: browser, tab: tab) {
+                              onDropTabs: { moving, point in dropSelected(moving, at: point) },
+                              outside: { browser.dragOut(tab) },
+                              outsideTabs: { browser.dragOut($0) },
+                              browser: browser, tab: tab,
+                              moveSelected: { moving, target in
+                browser.move(moving, within: group, to: target, startingWith: tab)
+            }) {
                 if browser.prefs.usesTabGroups && tab.pin == nil {
                     browser.move(tab, within: group, to: $0)
                 } else {
@@ -313,6 +320,13 @@ struct TabBar: View {
         if let id = groupFrames.first(where: { $0.value.contains(point) })?.key {
             browser.move(tab, toGroup: id)
         }
+    }
+
+    private func dropSelected(_ tabs: [Tab], at point: CGPoint) {
+        guard browser.prefs.usesTabGroups,
+              tabs.contains(where: { $0.pin == nil }),
+              let id = groupFrames.first(where: { $0.value.contains(point) })?.key else { return }
+        browser.moveSelectedTabs(toGroup: id)
     }
 
     /// How wide the run of tabs is: as wide as the tabs while they fit, as
@@ -553,10 +567,13 @@ private struct TabPill: View {
                 browser.select(tab)
             }
         })
+        .modifier(TabSelectionInteraction(browser: browser, tab: tab))
         .overlay { MiddleClick(act: close) }
         .onHover { hovering = $0 }
         .contextMenu { TabMenu(browser: browser, tab: tab, close: close) }
-        .help(pinned || compact ? tab.label : "")
+        .help(pinned || compact
+              ? "\(tab.label). \(TabSelectionInteraction.helpText)"
+              : TabSelectionInteraction.helpText)
         .animation(Motion.quick, value: hovering)
         .animation(Motion.glide, value: editing)
         .animation(Motion.glide, value: tab.pin)
@@ -688,6 +705,9 @@ private struct TabPill: View {
             }
             .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
             .matchedGeometryEffect(id: "live", in: pill)
+        } else if browser.isTabSelected(tab) {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(pinned ? Palette.pinLive : Palette.wash)
         } else if hovering {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(Palette.hover)
@@ -702,6 +722,7 @@ private struct TabPill: View {
 
     private var colour: Color {
         if live { return Palette.ink }
+        if browser.isTabSelected(tab) { return Palette.ink }
         return hovering ? Palette.ink.opacity(0.7) : Palette.muted
     }
 }
@@ -731,16 +752,20 @@ struct Carried: ViewModifier {
     var onDrop: ((CGPoint) -> Void)? = nil
     /// A paired item can be picked up from either half; report that source.
     var onDropTab: ((Tab, CGPoint) -> Void)? = nil
+    var onDropTabs: (([Tab], CGPoint) -> Void)? = nil
     /// Let go outside the window: true when the tab was taken elsewhere —
     /// another window, or a new one (see Browser.dragOut).
     var outside: (() -> Bool)? = nil
+    var outsideTabs: (([Tab]) -> Bool)? = nil
     var browser: Browser? = nil
     var tab: Tab? = nil
+    var moveSelected: (([Tab], Int) -> Bool)? = nil
     let move: (Int) -> Void
 
     @State private var held = false
     @State private var from = 0
     @State private var travel: CGFloat = 0
+    @State private var carriedTabs: [Tab] = []
 
     func body(content: Content) -> some View {
         // What it has travelled, less the ground its new place has already
@@ -762,18 +787,28 @@ struct Carried: ViewModifier {
                         if !held {
                             held = true
                             from = index
+                            if let browser, let tab, browser.isTabSelected(tab) {
+                                carriedTabs = browser.selectedTabs
+                            } else if let tab {
+                                carriedTabs = [tab]
+                            }
                         }
                         travel = vertical ? value.translation.height : value.translation.width
-                        if let browser, let tab, browser.prefs.splitView,
+                        if carriedTabs.count == 1, let browser, let tab, browser.prefs.splitView,
                            TabDrag.shared.update(browser: browser, tab: tab,
                                                  translation: value.translation) { return }
                         let target = min(max(0, from + Int((travel / step).rounded())), count - 1)
                         if target != index {
-                            withAnimation(Motion.settle) { move(target) }
+                            withAnimation(Motion.settle) {
+                                if carriedTabs.count > 1, moveSelected?(carriedTabs, target) == true { return }
+                                move(target)
+                            }
                         }
                     }
                     .onEnded { value in
-                        if let browser, let tab, browser.prefs.splitView {
+                        if carriedTabs.count > 1 {
+                            if outsideTabs?(carriedTabs) != true { onDropTabs?(carriedTabs, value.location) }
+                        } else if let browser, let tab, browser.prefs.splitView {
                             let finished = TabDrag.shared.finish(browser: browser, tab: tab)
                             let source = finished.source
                             switch finished.drop {
@@ -798,6 +833,7 @@ struct Carried: ViewModifier {
                         withAnimation(Motion.settle) {
                             held = false
                             travel = 0
+                            carriedTabs = []
                         }
                     }
             )
@@ -806,6 +842,7 @@ struct Carried: ViewModifier {
                 move(from)
                 held = false
                 travel = 0
+                carriedTabs = []
             }
     }
 }
@@ -926,7 +963,14 @@ struct TabMenu: View {
     @ObservedObject var tab: Tab
     let close: () -> Void
 
-    var body: some View {
+    private var isBulk: Bool { browser.selectedTabCount > 1 && browser.isTabSelected(tab) }
+
+    @ViewBuilder var body: some View {
+        if isBulk { bulkActions }
+        else { singleActions }
+    }
+
+    @ViewBuilder private var singleActions: some View {
         if browser.prefs.usesTabGroups && tab.pin == nil && !tab.shy && !tab.bench {
             Menu("Move to Group") {
                 Button("New Group") { browser.addTabGroup(containing: tab) }
@@ -1038,6 +1082,92 @@ struct TabMenu: View {
         // look for it: here too, where tabs are closed.
         Button("Reopen Closed Tab") { browser.reopen() }
             .disabled(browser.ghosts.isEmpty)
+        Divider()
+        Button("Select All Tabs") { browser.selectAllTabs() }
+            .help("Command-click tabs to add or remove them from a selection. Shift-click to select a range.")
+            .onAppear {
+                if !browser.isTabSelected(tab) { browser.clearTabSelection() }
+            }
+        if browser.selectedTabCount > 0 {
+            Button("Clear Selection") { browser.clearTabSelection() }
+        }
+    }
+
+    @ViewBuilder private var bulkActions: some View {
+        Text("\(browser.selectedTabCount) Tabs Selected")
+        Divider()
+        Button("Select All Tabs") { browser.selectAllTabs() }
+        Button("Clear Selection") { browser.clearTabSelection() }
+        if browser.prefs.usesTabGroups && browser.canGroupSelection {
+            Menu("Move Selected to Group") {
+                Button("New Group") { browser.addTabGroupForSelection() }
+                if !browser.tabGroups.isEmpty { Divider() }
+                ForEach(browser.tabGroups) { group in
+                    Button(group.name) { browser.moveSelectedTabs(toGroup: group.id) }
+                        .disabled(browser.selectedTabs.allSatisfy { $0.groupID == group.id })
+                }
+                Divider()
+                Button("Remove from Group") { browser.moveSelectedTabs(toGroup: nil) }
+                    .disabled(browser.selectedTabs.allSatisfy { $0.groupID == nil })
+            }
+        }
+        if browser.selectedTabs.contains(where: { $0.pin == nil }) {
+            Button("Pin Selected Tabs") { browser.pinSelectedTabs() }
+                .disabled(!browser.selectedTabs.allSatisfy { !$0.shy && !$0.bench && !$0.isBlank })
+        }
+        if browser.selectedTabs.contains(where: { $0.pin != nil }) {
+            Button("Unpin Selected Tabs") { browser.unpinSelectedTabs() }
+        }
+        if browser.canMoveSelectionToSpace {
+            Menu("Move Selected to Space") {
+                ForEach(browser.spaces.filter { $0.id != browser.spaceID }) { space in
+                    Button {
+                        browser.moveSelectedTabs(toSpace: space.id)
+                    } label: {
+                        Label(space.name, systemImage: space.symbol)
+                    }
+                }
+                if browser.spaces.count > 1 { Divider() }
+                Button("New Space…") {
+                    browser.askForSpace { space in
+                        browser.moveSelectedTabs(toSpace: space.id) {
+                            browser.switchSpace(to: space.id)
+                        }
+                    }
+                }
+            }
+            .help("Pages moved to a Space with different sign-ins reopen there.")
+        }
+        if browser.canMoveSelectionToWindow {
+            let others = Browsers.all.filter { $0 !== browser && $0.isOpen && $0.extensionPopup == nil }
+            if others.isEmpty {
+                Button("Move Selected to New Window") { browser.moveSelectedTabsToWindow(nil) }
+                    .disabled(browser.tabs.count <= browser.selectedTabCount)
+            } else {
+                Menu("Move Selected to Window") {
+                    Button("New Window") { browser.moveSelectedTabsToWindow(nil) }
+                        .disabled(browser.tabs.count <= browser.selectedTabCount)
+                    Divider()
+                    ForEach(Array(others.enumerated()), id: \.offset) { _, other in
+                        Button(other.windowName) { browser.moveSelectedTabsToWindow(other) }
+                    }
+                }
+            }
+        }
+        Divider()
+        Button("Duplicate Selected Tabs") { browser.duplicateSelectedTabs() }
+            .disabled(!browser.canDuplicateSelection)
+        Button("Copy Addresses") { browser.copySelectedAddresses() }
+            .disabled(!browser.canCopySelectedAddresses)
+        Button(browser.selectedTabs.allSatisfy(\.muted) ? "Unmute Selected Tabs" : "Mute Selected Tabs") {
+            browser.setMutedForSelection(!browser.selectedTabs.allSatisfy(\.muted))
+        }
+        Button("Put Selected Tabs to Sleep") { browser.sleepSelectedTabs() }
+            .disabled(!browser.canSleepSelection)
+        Divider()
+        Button("Close \(browser.selectedTabCount) Tabs") { browser.closeSelectedTabs() }
+        Button("Close Other Tabs") { browser.closeOthersKeepingSelection() }
+            .disabled(browser.tabs.count <= browser.selectedTabCount)
     }
 }
 
@@ -1052,6 +1182,72 @@ struct OneClick: ViewModifier {
         } else {
             content.onTapGesture(perform: act)
         }
+    }
+}
+
+/// Command-click adds or removes a tab and Shift-click selects a range. The
+/// native view takes only those modified left clicks, leaving an ordinary
+/// press to SwiftUI's existing single and double click behavior.
+struct ModifiedClick: NSViewRepresentable {
+    let act: (NSEvent.ModifierFlags) -> Void
+
+    func makeNSView(context: Context) -> NSView { Catch() }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        (view as? Catch)?.act = act
+    }
+
+    private final class Catch: NSView {
+        var act: (NSEvent.ModifierFlags) -> Void = { _ in }
+        private var pressed = false
+        private var modifiers: NSEvent.ModifierFlags = []
+
+        override var mouseDownCanMoveWindow: Bool { false }
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            guard let event = NSApp.currentEvent,
+                  event.type == .leftMouseDown,
+                  event.modifierFlags.intersection([.control, .option]).isEmpty,
+                  !event.modifierFlags.intersection([.command, .shift]).isEmpty
+            else { return nil }
+            return super.hitTest(point)
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            pressed = true
+            modifiers = event.modifierFlags.intersection([.command, .shift])
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            guard pressed else { return }
+            pressed = false
+            if bounds.contains(convert(event.locationInWindow, from: nil)) { act(modifiers) }
+        }
+    }
+}
+
+/// Selection input and its accessibility state shared by all tab drawings.
+struct TabSelectionInteraction: ViewModifier {
+    static let helpText = "Command-click to add or remove tabs; Shift-click selects a range."
+
+    let browser: Browser
+    let tab: Tab
+    var interactive = true
+    var extraValue = ""
+
+    private var selected: Bool { browser.isTabSelected(tab) }
+
+    func body(content: Content) -> some View {
+        content
+            .overlay {
+                if interactive { ModifiedClick { browser.selectForBulkAction(tab, modifiers: $0) } }
+            }
+            .accessibilityAddTraits(selected ? .isSelected : [])
+            .accessibilityValue(([selected ? "Selected for bulk actions" : "", extraValue]
+                .filter { !$0.isEmpty }).joined(separator: "; "))
+            .accessibilityAction(named: "Toggle tab selection") {
+                if interactive { browser.toggleTabSelection(tab) }
+            }
     }
 }
 

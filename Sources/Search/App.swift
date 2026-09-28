@@ -56,7 +56,12 @@ struct SearchApp: App {
                 Button("Bring Things Over…") { browser.bringingIn = "" }
                     .shortcut("file.import")
                 Divider()
-                Button("Close Tab") { if let tab = browser.active { browser.close(tab) } }
+                Button(browser.selectedTabCount > 1
+                       ? "Close \(browser.selectedTabCount) Tabs"
+                       : (browser.selectedTabCount == 1 ? "Close Selected Tab" : "Close Tab")) {
+                    if browser.selectedTabCount > 0 { browser.closeSelectedTabs() }
+                    else if let tab = browser.active { browser.close(tab) }
+                }
                     .shortcut("file.closeTab")
             }
             CommandGroup(replacing: .printItem) {
@@ -130,6 +135,11 @@ struct SearchApp: App {
                     .shortcut("view.inspect")
             }
             CommandMenu("Tabs") {
+                Button("Select All Tabs") { browser.selectAllTabs() }
+                if browser.selectedTabCount > 0 {
+                    Button("Clear Selection") { browser.clearTabSelection() }
+                }
+                Divider()
                 Button("Back") { browser.back() }
                     .shortcut("tabs.back")
                     .disabled(browser.active?.canGoBack != true)
@@ -182,9 +192,16 @@ struct SearchApp: App {
                 Button("Paste and Go") { browser.pasteAndGo() }
                     .shortcut("tabs.pasteAndGo")
                 Divider()
-                Button("Close Other Tabs") { if let tab = browser.active { browser.closeOthers(but: tab) } }
+                Button("Close Other Tabs") {
+                    if browser.selectedTabCount > 0 { browser.closeOthersKeepingSelection() }
+                    else if let tab = browser.active { browser.closeOthers(but: tab) }
+                }
                     .shortcut("tabs.closeOthers")
-                    .disabled(browser.tabs.count < 2)
+                    .disabled(browser.tabs.count <= max(1, browser.selectedTabCount))
+                if browser.selectedTabCount > 0 {
+                    Button("Close Selected Tabs") { browser.closeSelectedTabs() }
+                        .disabled(browser.selectedTabCount == 0)
+                }
                 Button("Stop Sound in Tab") { browser.pauseMedia() }
                     .shortcut("tabs.mute")
             }
@@ -1122,6 +1139,10 @@ struct ContentView: View {
                 browser.picked = nil
                 return true
             }
+            if browser.selectedTabCount > 0 {
+                browser.clearTabSelection()
+                return true
+            }
             guard browser.editing, browser.active?.isBlank == false else { return false }
             browser.dismiss()
             return true
@@ -1334,7 +1355,9 @@ struct ContentView: View {
         case "0":
             browser.resetZoom()
         case "w" where !shifted:
-            if browser.peekTab != nil {
+            if browser.selectedTabCount > 0 {
+                browser.closeSelectedTabs()
+            } else if browser.peekTab != nil {
                 browser.closePeek()
             } else if let tab = browser.active {
                 browser.close(tab)

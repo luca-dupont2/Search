@@ -30,7 +30,18 @@ final class Browser: NSObject, ObservableObject {
     /// ⌘1–9, ⌃Tab and the extensions' tab indexes read this row, so it and
     /// what is on screen never disagree.
     @Published private(set) var tabs: [Tab] = [] {
-        didSet { arrangeGroupedTabs() }
+        didSet {
+            arrangeGroupedTabs()
+            let live = Set(tabs.map(\.id))
+            if !selectedTabIDs.isSubset(of: live) {
+                selectedTabIDs.formIntersection(live)
+                if selectedTabIDs.isEmpty {
+                    selectionAnchor = nil
+                } else if let selectionAnchor, !selectedTabIDs.contains(selectionAnchor) {
+                    self.selectionAnchor = selectedTabs.first?.id
+                }
+            }
+        }
     }
     @Published private(set) var splits: [TabSplit] = []
     /// Named tab sections in the current space, in display order.
@@ -46,6 +57,7 @@ final class Browser: NSObject, ObservableObject {
                 DispatchQueue.main.async { held.forEach { $0.present() } }
             }
             guard oldValue != activeID else { return }
+            clearTabSelection()
             // What was found belongs to the page just left; the words typed
             // go on to be looked for on this one.
             invalidateFindPage(retryOnActiveTab: true)
@@ -68,6 +80,11 @@ final class Browser: NSObject, ObservableObject {
             if let left { tabSwitcher.left(left, alive: Set((tabs + parkedTabs).map(\.id))) }
         }
     }
+
+    /// Tabs marked for a bulk action. They are window-local, and never enter
+    /// a session file. A split pair contributes both IDs as one visible item.
+    @Published private(set) var selectedTabIDs: Set<Tab.ID> = []
+    private var selectionAnchor: Tab.ID?
 
     var activeSplit: TabSplit? {
         guard prefs.splitView, let activeID else { return nil }
@@ -1048,6 +1065,7 @@ final class Browser: NSObject, ObservableObject {
     /// at, as a pin in Arc goes home (#141). Already there, the double-click
     /// changes its letter, as it always did.
     func goHome(_ tab: Tab) {
+        clearTabSelection()
         guard tab.pin != nil else { return }
         guard let home = tab.home, !Browser.samePage(home, tab.address) else { return editLetter(tab) }
         tab.go(to: home)
@@ -1119,6 +1137,7 @@ final class Browser: NSObject, ObservableObject {
     @Published private(set) var renamingTab = false
 
     func beginTabEdit(_ tab: Tab) {
+        clearTabSelection()
         guard let url = tab.address else {
             edit()
             return
@@ -1131,6 +1150,7 @@ final class Browser: NSObject, ObservableObject {
     /// Rename. The name the tab is wearing arrives selected, so typing
     /// replaces it; emptying the field gives the page its own title back.
     func beginTabRename(_ tab: Tab) {
+        clearTabSelection()
         renamingTab = true
         tabDraft = tab.label
         editingTab = tab.id
@@ -2074,6 +2094,7 @@ final class Browser: NSObject, ObservableObject {
     }
 
     func focusPane(_ tab: Tab) {
+        clearTabSelection()
         guard tabs.contains(where: { $0.id == tab.id }) else { return }
         if let pair = split(for: tab), activeSplit?.id == pair.id {
             guard activeID != tab.id else { return }
@@ -2114,6 +2135,64 @@ final class Browser: NSObject, ObservableObject {
         row.insert(contentsOf: moving, at: from < index ? target + targetSize : target)
         tabs = row
         rememberSession()
+    }
+
+    /// Carrying a selected block over a new row position keeps its display
+    /// order and any split pairs together. Tabs from different groups or pin
+    /// sections keep the ordinary single-tab drag behavior.
+    @discardableResult
+    func move(_ moving: [Tab], within group: UUID?, to index: Int, startingWith source: Tab) -> Bool {
+        let ids = Set(moving.map(\.id))
+        guard moving.count > 1, ids.count == moving.count,
+              moving.allSatisfy({ tab in tabs.contains(where: { $0.id == tab.id }) }) else { return false }
+
+        let pinned = source.pin != nil
+        guard moving.allSatisfy({ ($0.pin != nil) == pinned }) else { return false }
+        if !pinned, prefs.usesTabGroups,
+           !moving.allSatisfy({ self.group(of: $0) == group }) { return false }
+
+        let peers: [Tab]
+        if pinned {
+            peers = displayedTabs.filter { $0.pin != nil }
+        } else if prefs.usesTabGroups {
+            peers = tabs(in: group).filter(standsInRow)
+        } else {
+            peers = displayedTabs.filter { $0.pin == nil }
+        }
+        let sourceID = split(for: source)?.left ?? source.id
+        guard let sourceIndex = peers.firstIndex(where: { $0.id == sourceID }),
+              !peers.isEmpty else { return false }
+        let selectedRepresentatives = peers.filter { ids.contains($0.id) }
+        let represented = Set(selectedRepresentatives.flatMap { selectionUnit(for: $0).map(\.id) })
+        guard !selectedRepresentatives.isEmpty, represented == ids else { return false }
+
+        let targetIndex = min(max(0, index), peers.count - 1)
+        let movesDown = targetIndex > sourceIndex
+        var anchorIndex = targetIndex
+        if ids.contains(peers[anchorIndex].id) {
+            let search = movesDown
+                ? Array((anchorIndex + 1)..<peers.count)
+                : Array((0..<anchorIndex).reversed())
+            guard let next = search.first(where: { !ids.contains(peers[$0].id) }) else { return true }
+            anchorIndex = next
+        }
+        let anchor = peers[anchorIndex]
+        var row = tabs.filter { !ids.contains($0.id) }
+        guard let anchorIndexInRow = row.firstIndex(where: { $0.id == anchor.id }) else { return false }
+        let insertion: Int
+        if movesDown {
+            let anchorIDs = Set(selectionUnit(for: anchor).map(\.id))
+            let last = row.indices.last(where: { anchorIDs.contains(row[$0].id) }) ?? anchorIndexInRow
+            insertion = last + 1
+        } else {
+            insertion = anchorIndexInRow
+        }
+        let block = tabs.filter { ids.contains($0.id) }
+        row.insert(contentsOf: block, at: min(insertion, row.count))
+        guard !row.elementsEqual(tabs, by: { $0.id == $1.id }) else { return true }
+        tabs = row
+        rememberSession()
+        return true
     }
 
     func dropTabIntoStrip(_ tab: Tab, before target: Tab?) {
@@ -2201,6 +2280,7 @@ final class Browser: NSObject, ObservableObject {
     }
 
     func select(_ tab: Tab, floatPrevious: Bool = true) {
+        clearTabSelection()
         if let pair = split(for: tab), activeSplit?.id == pair.id, activeID != tab.id {
             focusPane(tab)
             return
@@ -2488,6 +2568,20 @@ final class Browser: NSObject, ObservableObject {
         return true
     }
 
+    /// A selected block follows its first tab when it leaves this window.
+    func dragOut(_ moving: [Tab], at point: NSPoint = NSEvent.mouseLocation) -> Bool {
+        guard !moving.isEmpty, let window,
+              !window.frame.insetBy(dx: -12, dy: -12).contains(point),
+              moving.allSatisfy({ tab in
+                  tab.pin == nil && !tab.bench && tabs.contains(where: { $0.id == tab.id })
+              })
+        else { return false }
+        let over = Browsers.all.first { $0 !== self && $0.isOpen && $0.window?.frame.contains(point) == true }
+        guard over != nil || tabs.count > moving.count || moving.contains(where: { !$0.isBlank }) else { return false }
+        DispatchQueue.main.async { [weak self] in self?.moveTabsToWindow(moving, to: over, at: point) }
+        return true
+    }
+
     /// Out of this row, not closed: it is on its way to another window.
     private func detach(_ tab: Tab) {
         guard let index = tabs.firstIndex(where: { $0.id == tab.id }) else { return }
@@ -2547,6 +2641,14 @@ final class Browser: NSObject, ObservableObject {
     func toggleTabGroup(_ id: UUID) {
         guard let index = tabGroups.firstIndex(where: { $0.id == id }) else { return }
         tabGroups[index].collapsed.toggle()
+        if tabGroups[index].collapsed {
+            selectedTabIDs.subtract(Set(tabs(in: id).map(\.id)))
+            if selectedTabIDs.isEmpty {
+                selectionAnchor = nil
+            } else if let selectionAnchor, !selectedTabIDs.contains(selectionAnchor) {
+                self.selectionAnchor = selectedTabs.first?.id
+            }
+        }
         writeSession(now: true)
     }
 
@@ -2651,6 +2753,320 @@ final class Browser: NSObject, ObservableObject {
         return displayedTabs.filter { $0.pin != nil }
             + tabGroups.flatMap { visibleTabs(in: $0) }
             + tabs(in: nil).filter(standsInRow)
+    }
+
+    /// The selected pages in display order. A visible split item expands to
+    /// both pages, even though it occupies one place in the tab row.
+    var selectedTabs: [Tab] {
+        var ids = Set<Tab.ID>()
+        for item in shownTabs where selectedTabIDs.contains(item.id) {
+            ids.formUnion(selectionUnit(for: item).map(\.id))
+        }
+        return tabs.filter { ids.contains($0.id) }
+    }
+
+    var selectedTabCount: Int { selectedTabs.count }
+
+    func isTabSelected(_ tab: Tab) -> Bool {
+        selectionUnit(for: tab).contains { selectedTabIDs.contains($0.id) }
+    }
+
+    private func selectionUnit(for tab: Tab) -> [Tab] {
+        guard let pair = split(for: tab) else { return [tab] }
+        return pair.tabs.compactMap { id in tabs.first { $0.id == id } }
+    }
+
+    func clearTabSelection() {
+        guard !selectedTabIDs.isEmpty || selectionAnchor != nil else { return }
+        selectedTabIDs = []
+        selectionAnchor = nil
+    }
+
+    /// Modifier clicks change the action selection without changing the page
+    /// shown in the window.
+    func selectForBulkAction(_ tab: Tab, modifiers: NSEvent.ModifierFlags) {
+        guard !tab.bench, modifiers.contains(.command) || modifiers.contains(.shift) else { return }
+        let shown = shownTabs.filter { !$0.bench }
+        let clicked = split(for: tab)?.left ?? tab.id
+        guard let clickedIndex = shown.firstIndex(where: { $0.id == clicked }) else { return }
+
+        if modifiers.contains(.shift) {
+            let anchorID = selectionAnchor ?? activeSplit?.left ?? activeID ?? clicked
+            let anchor = shown.firstIndex { item in
+                item.id == anchorID || selectionUnit(for: item).contains { $0.id == anchorID }
+            } ?? clickedIndex
+            let bounds = min(anchor, clickedIndex)...max(anchor, clickedIndex)
+            var range = Set<Tab.ID>()
+            for item in bounds.map({ shown[$0] }) { range.formUnion(selectionUnit(for: item).map(\.id)) }
+            if modifiers.contains(.command) { selectedTabIDs.formUnion(range) }
+            else { selectedTabIDs = range }
+            selectionAnchor = shown[anchor].id
+            return
+        }
+
+        let unit = selectionUnit(for: tab).map(\.id)
+        var startedFromEmpty = false
+        if selectedTabIDs.isEmpty {
+            startedFromEmpty = true
+            if let activeID, let active = tabs.first(where: { $0.id == activeID }), !active.bench {
+                selectedTabIDs.formUnion(selectionUnit(for: active).map(\.id))
+                selectionAnchor = activeSplit?.left ?? activeID
+            } else {
+                selectionAnchor = clicked
+            }
+        }
+        if unit.allSatisfy({ selectedTabIDs.contains($0) }) {
+            if startedFromEmpty { return }
+            selectedTabIDs.subtract(unit)
+            if selectedTabIDs.isEmpty { selectionAnchor = nil }
+            else if unit.contains(where: { $0 == selectionAnchor }) { selectionAnchor = selectedTabs.first?.id }
+        } else {
+            selectedTabIDs.formUnion(unit)
+            if selectionAnchor == nil { selectionAnchor = clicked }
+        }
+    }
+
+    func selectAllTabs() {
+        guard !tabs.isEmpty else { return }
+        for index in tabGroups.indices { tabGroups[index].collapsed = false }
+        selectedTabIDs = Set(displayedTabs.filter { !$0.bench }.flatMap { selectionUnit(for: $0).map(\.id) })
+        selectionAnchor = shownTabs.first(where: { !$0.bench })?.id
+        if prefs.usesTabGroups { writeSession(now: true) }
+    }
+
+    func selectTabs(inGroup id: UUID) {
+        guard let index = tabGroups.firstIndex(where: { $0.id == id }) else { return }
+        tabGroups[index].collapsed = false
+        let members = tabs(in: id).filter { !$0.bench && standsInRow($0) }
+        selectedTabIDs = Set(members.flatMap { selectionUnit(for: $0).map(\.id) })
+        selectionAnchor = members.first?.id
+        writeSession(now: true)
+    }
+
+    var canGroupSelection: Bool {
+        !selectedTabs.isEmpty && selectedTabs.allSatisfy { $0.pin == nil && !$0.shy && !$0.bench }
+    }
+
+    var canMoveSelectionToSpace: Bool {
+        prefs.usesSpaces && !selectedTabs.isEmpty && selectedTabs.allSatisfy {
+            !$0.bench && $0.address.flatMap({ Browser.extensionHost(of: $0) }) == nil
+        }
+    }
+
+    var canMoveSelectionToWindow: Bool {
+        !selectedTabs.isEmpty && selectedTabs.allSatisfy { $0.pin == nil && !$0.bench }
+    }
+
+    var canCopySelectedAddresses: Bool {
+        !selectedTabs.isEmpty && selectedTabs.allSatisfy { $0.address != nil }
+    }
+
+    var canDuplicateSelection: Bool { canCopySelectedAddresses }
+
+    var canSleepSelection: Bool {
+        !selectedTabs.isEmpty && selectedTabs.allSatisfy { awake(because: $0) == nil }
+    }
+
+    func toggleTabSelection(_ tab: Tab) {
+        guard !tab.bench else { return }
+        let unit = selectionUnit(for: tab).map(\.id)
+        if unit.allSatisfy({ selectedTabIDs.contains($0) }) {
+            selectedTabIDs.subtract(unit)
+            if selectedTabIDs.isEmpty { selectionAnchor = nil }
+            else if unit.contains(where: { $0 == selectionAnchor }) { selectionAnchor = selectedTabs.first?.id }
+        } else {
+            selectedTabIDs.formUnion(unit)
+            if selectionAnchor == nil { selectionAnchor = split(for: tab)?.left ?? tab.id }
+        }
+    }
+
+    func closeSelectedTabs() {
+        let closing = selectedTabs
+        guard !closing.isEmpty else { return }
+        clearTabSelection()
+        for tab in closing { close(tab) }
+    }
+
+    func closeOthersKeepingSelection() {
+        let keeping = selectedTabs
+        guard !keeping.isEmpty else { return }
+        let ids = Set(keeping.map(\.id))
+        let closing = tabs.filter { !ids.contains($0.id) }
+        let focus = activeID.flatMap { id in keeping.first { $0.id == id } } ?? keeping.first
+        clearTabSelection()
+        if let focus { select(focus) }
+        for tab in closing { close(tab) }
+        if let focus, tabs.contains(where: { $0.id == focus.id }) { select(focus) }
+    }
+
+    func moveSelectedTabs(toGroup id: UUID?) {
+        let moving = selectedTabs
+        guard !moving.isEmpty,
+              moving.allSatisfy({ $0.pin == nil && !$0.shy && !$0.bench }),
+              id == nil || tabGroups.contains(where: { $0.id == id }) else { return }
+        let previous = Set(moving.compactMap(\.groupID))
+        for tab in moving { tab.groupID = id }
+        for group in previous { removeEmptyGroup(group) }
+        if let id, let index = tabGroups.firstIndex(where: { $0.id == id }) { tabGroups[index].collapsed = false }
+        arrangeGroupedTabs()
+        writeSession(now: true)
+    }
+
+    @discardableResult
+    func addTabGroupForSelection() -> UUID? {
+        let moving = selectedTabs
+        guard !moving.isEmpty,
+              moving.allSatisfy({ $0.pin == nil && !$0.shy && !$0.bench }) else { return nil }
+        let id = UUID()
+        tabGroups.append(TabGroup(id: id, name: "Group \(tabGroups.count + 1)", collapsed: false))
+        editingGroupID = id
+        moveSelectedTabs(toGroup: id)
+        return id
+    }
+
+    func pinSelectedTabs() {
+        let moving = selectedTabs
+        guard !moving.isEmpty, moving.allSatisfy({ !$0.bench && !$0.shy && !$0.isBlank }) else { return }
+        for tab in moving where tab.pin == nil { pin(tab) }
+    }
+
+    func unpinSelectedTabs() {
+        let moving = selectedTabs.filter { $0.pin != nil }
+        for tab in moving { unpin(tab) }
+    }
+
+    func setMutedForSelection(_ muted: Bool) {
+        for tab in selectedTabs where tab.muted != muted { tab.toggleMute() }
+    }
+
+    func copySelectedAddresses() {
+        let pages = selectedTabs
+        guard !pages.isEmpty, pages.allSatisfy({ $0.address != nil }) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(pages.compactMap { $0.address?.absoluteString }.joined(separator: "\n"), forType: .string)
+        announce("\(pages.count) addresses copied")
+    }
+
+    func duplicateSelectedTabs() {
+        let pages = selectedTabs
+        guard !pages.isEmpty, pages.allSatisfy({ $0.address != nil }) else { return }
+        clearTabSelection()
+        for tab in pages {
+            if let url = tab.address { _ = open(url, foreground: false, atEnd: true, from: tab, mayWait: true) }
+        }
+    }
+
+    func sleepSelectedTabs() {
+        let pages = selectedTabs
+        guard !pages.isEmpty else { return }
+        var pending = pages.count
+        var slept = 0
+        for tab in pages {
+            sleep(tab) { outcome in
+                if outcome == "asleep" { slept += 1 }
+                pending -= 1
+                guard pending == 0 else { return }
+                let skipped = pages.count - slept
+                self.announce(skipped == 0 ? "Put \(slept) tabs to sleep" : "Put \(slept) tabs to sleep, \(skipped) stayed awake")
+            }
+        }
+    }
+
+    func moveSelectedTabs(toSpace id: UUID, then: (() -> Void)? = nil) {
+        let moving = selectedTabs
+        guard !moving.isEmpty, prefs.usesSpaces, id != spaceID,
+              spaces.contains(where: { $0.id == id }),
+              moving.allSatisfy({ !$0.bench && $0.address.flatMap({ Browser.extensionHost(of: $0) }) == nil })
+        else { return }
+        let origin = spaceID
+        let destinationStore = Spaces.store(for: id)
+        func check(_ index: Int, foundUnsaved: Bool) {
+            guard self.spaceID == origin, moving.allSatisfy({ tab in self.tabs.contains { $0.id == tab.id } }) else { return }
+            guard index < moving.count else {
+                let finish = { [weak self] in
+                    guard let self, self.finishMove(moving, toSpace: id) else { return }
+                    then?()
+                }
+                if foundUnsaved, let destination = self.spaces.first(where: { $0.id == id }) {
+                    Ask.sure(
+                        "Move \(moving.count) Tabs?",
+                        detail: "Some pages have unsaved form entries. They will reopen in “\(destination.name)” with that Space’s sign-ins, so the entries may be lost.",
+                        confirm: "Move",
+                        then: finish
+                    )
+                } else { finish() }
+                return
+            }
+            let tab = moving[index]
+            guard !tab.shy, tab.store !== destinationStore else { check(index + 1, foundUnsaved: foundUnsaved); return }
+            tab.unsaved { unsaved in check(index + 1, foundUnsaved: foundUnsaved || unsaved) }
+        }
+        check(0, foundUnsaved: false)
+    }
+
+    private func finishMove(_ moving: [Tab], toSpace id: UUID) -> Bool {
+        guard prefs.usesSpaces, id != spaceID,
+              let destination = spaces.first(where: { $0.id == id }) else { return false }
+        let live = moving.filter { tab in tabs.contains { $0.id == tab.id } }
+        guard !live.isEmpty else { return false }
+        let ids = Set(live.map(\.id))
+        let oldSpace = spaceID
+        let keptPairs = splits.filter { $0.tabs.allSatisfy(ids.contains) }
+        let removedGroups = Set(live.compactMap(\.groupID))
+        let wasActive = activeID.map(ids.contains) == true
+        if live.contains(where: { floating == $0.id }) { land() }
+        if let editingTab, ids.contains(editingTab) { cancelTabEdit() }
+        splits.removeAll { $0.tabs.contains(where: ids.contains) }
+        let remaining = tabs.filter { !ids.contains($0.id) }
+        tabs = remaining
+        for group in removedGroups { removeEmptyGroup(group) }
+        if wasActive { activeID = remaining.first?.id }
+        if tabs.isEmpty { adopt(Tab(configuration: Web.configuration(space: oldSpace))) }
+
+        var row = parked[id] ?? loadRow(id)
+        for tab in live {
+            tab.rehome(in: id)
+            tab.groupID = nil
+            let place = tab.pin == nil ? row.tabs.count : (row.tabs.firstIndex { $0.pin == nil } ?? row.tabs.count)
+            row.tabs.insert(tab, at: place)
+        }
+        row.splits.append(contentsOf: keptPairs)
+        if row.active == nil { row.active = live.first?.id }
+        parked[id] = row
+        writeSession(now: true)
+        writeSession(now: true, space: id, row: row)
+        announce("Moved \(live.count) tabs to \(destination.name)")
+        clearTabSelection()
+        return true
+    }
+
+    func moveSelectedTabsToWindow(_ target: Browser?) {
+        let moving = selectedTabs
+        guard !moving.isEmpty, moving.allSatisfy({ $0.pin == nil && !$0.bench }), target !== self else { return }
+        clearTabSelection()
+        moveTabsToWindow(moving, to: target)
+    }
+
+    private func moveTabsToWindow(_ moving: [Tab], to target: Browser?, at point: NSPoint? = nil) {
+        guard !moving.isEmpty, moving.allSatisfy({ $0.pin == nil && !$0.bench }), target !== self else { return }
+        let destination = target ?? Browser(record: WindowRecord(space: spaceID))
+        let ids = Set(moving.map(\.id))
+        let carriedPairs = splits.filter { $0.tabs.allSatisfy(ids.contains) }
+        for tab in moving where tabs.contains(where: { $0.id == tab.id }) {
+            detach(tab)
+            destination.receive(tab)
+        }
+        destination.splits.append(contentsOf: carriedPairs)
+        destination.rememberSession()
+        if target == nil {
+            let size = window?.frame.size ?? NSSize(width: 1180, height: 780)
+            let drop = point ?? NSEvent.mouseLocation
+            Browsers.open(destination, frame: NSRect(x: drop.x - 120,
+                                                    y: drop.y - size.height + 20,
+                                                    width: size.width, height: size.height))
+        } else {
+            destination.window?.makeKeyAndOrderFront(nil)
+        }
     }
 
     /// ⌃Tab, ⌃⇧Tab: the next tab on screen, round to the first again. It

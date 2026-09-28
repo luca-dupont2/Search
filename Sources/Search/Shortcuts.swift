@@ -151,7 +151,8 @@ struct Command: Identifiable {
         Command("file.reopen", "Reopen Closed Tab", .file, KeyCombo("t", shift: true)) { $0.reopen() },
         Command("file.openAddress", "Open Address…", .file, KeyCombo("l")) { $0.edit() },
         Command("file.closeTab", "Close Tab", .file, KeyCombo("w")) { browser in
-            if let tab = browser.active { browser.close(tab) }
+            if browser.selectedTabCount > 0 { browser.closeSelectedTabs() }
+            else if let tab = browser.active { browser.close(tab) }
         },
         Command("file.import", "Bring Things Over…", .file, nil) { $0.bringingIn = "" },
         Command("file.share", "Share…", .file, nil) { $0.share() },
@@ -203,7 +204,8 @@ struct Command: Identifiable {
         Command("tabs.copyMarkdown", "Copy as Markdown Link", .tabs, nil) { $0.copyMarkdownLink() },
         Command("tabs.pasteAndGo", "Paste and Go", .tabs, KeyCombo("v", shift: true)) { $0.pasteAndGo() },
         Command("tabs.closeOthers", "Close Other Tabs", .tabs, nil) { browser in
-            if let tab = browser.active { browser.closeOthers(but: tab) }
+            if browser.selectedTabCount > 0 { browser.closeOthersKeepingSelection() }
+            else if let tab = browser.active { browser.closeOthers(but: tab) }
         },
         Command("tabs.mute", "Stop Sound in Tab", .tabs, KeyCombo("m", shift: true)) { $0.pauseMedia() },
 

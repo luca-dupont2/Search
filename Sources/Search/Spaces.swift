@@ -184,6 +184,7 @@ extension Browser {
 
     private func enter(_ id: UUID) {
         guard id != spaceID, let to = spaces.firstIndex(where: { $0.id == id }) else { return }
+        clearTabSelection()
         // Which way the icon at the foot turns over: the way the spaces lie.
         if !makingSpace { spaceStep = to > (spaces.firstIndex { $0.id == spaceID } ?? 0) ? 1 : -1 }
         cancelTabEdit()

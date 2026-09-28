@@ -24,11 +24,11 @@ struct SplitTabItem: View {
         .frame(width: width, height: height)
         .background {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(live ? Palette.wash : Palette.ground.opacity(0.55))
+                .fill(live || browser.isTabSelected(left) ? Palette.wash : Palette.ground.opacity(0.55))
         }
         .overlay {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .strokeBorder(Palette.hairline.opacity(live ? 1 : 0.75), lineWidth: 1)
+                .strokeBorder(Palette.hairline.opacity(live || browser.isTabSelected(left) ? 1 : 0.75), lineWidth: 1)
                 .allowsHitTesting(false)
         }
         .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
@@ -71,6 +71,8 @@ private struct SplitTabHalf: View {
                 if focused { browser.beginTabEdit(tab) }
                 else { browser.focusPane(tab) }
             })
+            .modifier(TabSelectionInteraction(browser: browser, tab: tab, interactive: interactive,
+                                              extraValue: focused ? "Focused pane" : ""))
             .overlay {
                 if interactive { MiddleClick { browser.close(tab) } }
             }
@@ -85,11 +87,10 @@ private struct SplitTabHalf: View {
             }
             .accessibilityElement(children: editing ? .contain : .ignore)
             .accessibilityLabel(title)
-            .accessibilityValue(focused ? "Focused pane" : "")
             .accessibilityHint(interactive ? "Click to focus this pane; right-click for tab actions" : "")
             .accessibilityAction(named: "Focus pane") { browser.focusPane(tab) }
             .accessibilityAction(named: "Close tab") { if interactive { browser.close(tab) } }
-            .help(title)
+            .help("\(title). \(TabSelectionInteraction.helpText)")
     }
 
     private var decoratedRow: some View {
@@ -141,7 +142,7 @@ private struct SplitTabHalf: View {
                     .font(.system(size: 11.5))
                     .lineLimit(1)
                     .truncationMode(.tail)
-                    .foregroundStyle(focused ? Palette.ink : Palette.muted)
+                    .foregroundStyle(focused || browser.isTabSelected(tab) ? Palette.ink : Palette.muted)
             }
         }
     }

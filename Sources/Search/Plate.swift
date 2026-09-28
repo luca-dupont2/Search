@@ -100,20 +100,79 @@ struct Rule: View {
     }
 }
 
+/// Focus target for a searchable setting's control, passed from its row to
+/// whichever native control the row contains.
+struct SettingsControlFocus {
+    var id: String?
+    var title: String?
+    var focus: FocusState<String?>.Binding?
+
+    var isFocused: Bool {
+        guard let id else { return false }
+        return focus?.wrappedValue == id
+    }
+}
+
+private struct SettingsControlFocusKey: EnvironmentKey {
+    static let defaultValue = SettingsControlFocus(id: nil, title: nil, focus: nil)
+}
+
+extension EnvironmentValues {
+    var settingsControlFocus: SettingsControlFocus {
+        get { self[SettingsControlFocusKey.self] }
+        set { self[SettingsControlFocusKey.self] = newValue }
+    }
+}
+
+private struct SettingsControlFocusModifier: ViewModifier {
+    @Environment(\.settingsControlFocus) private var target
+    var enabled = true
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled, let id = target.id, let focus = target.focus {
+            content
+                .focusable()
+                .focused(focus, equals: id)
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    func settingsControlFocusTarget(_ enabled: Bool = true) -> some View {
+        modifier(SettingsControlFocusModifier(enabled: enabled))
+    }
+}
+
 /// One thing to set or do: what it is on the left, the control on the right.
 struct Line<Control: View>: View {
+    @Environment(\.settingsControlFocus) private var settingsFocus
+
     let title: String
     let detail: String?
+    let searchID: String?
+    let highlighted: Bool
     @ViewBuilder let control: () -> Control
 
-    init(_ title: String, _ detail: String? = nil, @ViewBuilder control: @escaping () -> Control) {
+    init(
+        _ title: String,
+        _ detail: String? = nil,
+        searchID: String? = nil,
+        highlighted: Bool = false,
+        @ViewBuilder control: @escaping () -> Control
+    ) {
         self.title = title
         self.detail = detail
+        self.searchID = searchID
+        self.highlighted = highlighted
         self.control = control
     }
 
+    @ViewBuilder
     var body: some View {
-        HStack(alignment: .center, spacing: 16) {
+        let row = HStack(alignment: .center, spacing: 16) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
                     .font(.system(size: 13))
@@ -128,9 +187,37 @@ struct Line<Control: View>: View {
             }
             Spacer(minLength: 8)
             control()
+                .environment(
+                    \.settingsControlFocus,
+                    SettingsControlFocus(id: searchID, title: title, focus: settingsFocus.focus)
+                )
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 11)
+        .background {
+            if highlighted {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(Palette.wash)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 2)
+            }
+        }
+        .overlay {
+            if highlighted {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Palette.ink.opacity(0.08), lineWidth: 1)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 2)
+                    .allowsHitTesting(false)
+            }
+        }
+        .animation(Motion.quick, value: highlighted)
+
+        if let searchID {
+            row.id(searchID)
+        } else {
+            row
+        }
     }
 }
 
